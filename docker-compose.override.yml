@@ -1,0 +1,7 @@
+services:
+  frontend:
+    ports:
+      - "80:80"
+  weblate:
+    ports:
+      - "8080:8080"
