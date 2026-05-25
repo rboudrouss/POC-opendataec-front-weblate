@@ -2,24 +2,22 @@ services:
   weblate:
     image: weblate/weblate:latest
     container_name: weblate
-    ports:
-      - "8080:8080"
     environment:
-      WEBLATE_EMAIL_HOST: localhost
-      WEBLATE_SERVER_EMAIL: noreply@localhost
-      WEBLATE_DEFAULT_FROM_EMAIL: noreply@localhost
-      WEBLATE_ALLOWED_HOSTS: localhost
-      WEBLATE_ADMIN_EMAIL: admin@localhost
-      WEBLATE_ADMIN_PASSWORD: admin
-      WEBLATE_ADMIN_NAME: Admin
-      WEBLATE_SITE_DOMAIN: localhost:8080
-      WEBLATE_SITE_TITLE: Espace de Travail
+      WEBLATE_EMAIL_HOST: ${WEBLATE_EMAIL_HOST:-localhost}
+      WEBLATE_SERVER_EMAIL: ${WEBLATE_SERVER_EMAIL:-noreply@localhost}
+      WEBLATE_DEFAULT_FROM_EMAIL: ${WEBLATE_DEFAULT_FROM_EMAIL:-noreply@localhost}
+      WEBLATE_ALLOWED_HOSTS: ${WEBLATE_ALLOWED_HOSTS:-localhost}
+      WEBLATE_ADMIN_EMAIL: ${WEBLATE_ADMIN_EMAIL:-admin@localhost}
+      WEBLATE_ADMIN_PASSWORD: ${WEBLATE_ADMIN_PASSWORD:-admin}
+      WEBLATE_ADMIN_NAME: ${WEBLATE_ADMIN_NAME:-Admin}
+      WEBLATE_SITE_DOMAIN: ${WEBLATE_SITE_DOMAIN:-localhost}
+      WEBLATE_SITE_TITLE: ${WEBLATE_SITE_TITLE:-Espace de Travail}
       WEBLATE_REGISTRATION_OPEN: 0
       POSTGRES_HOST: db
       POSTGRES_PORT: 5432
       POSTGRES_DATABASE: weblate
       POSTGRES_USER: weblate
-      POSTGRES_PASSWORD: weblate
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-weblate}
       REDIS_HOST: redis
     depends_on:
       db:
@@ -33,7 +31,7 @@ services:
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: weblate
-      POSTGRES_PASSWORD: weblate
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-weblate}
       POSTGRES_DB: weblate
     volumes:
       - postgres-data:/var/lib/postgresql/data
@@ -47,6 +45,32 @@ services:
     image: redis:7-alpine
     volumes:
       - redis-data:/data
+
+  backend:
+    build: ./backend
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: weblate
+      POSTGRES_USER: weblate
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-weblate}
+      WEBLATE_URL: http://weblate:8080
+      WEBLATE_SITE_DOMAIN: ${WEBLATE_SITE_DOMAIN:-localhost}
+    depends_on:
+      db:
+        condition: service_healthy
+      weblate:
+        condition: service_started
+    restart: unless-stopped
+
+  frontend:
+    build: .
+    ports:
+      - "${FRONTEND_PORT:-80}:80"
+    depends_on:
+      - weblate
+      - backend
+    restart: unless-stopped
 
 volumes:
   weblate-data:

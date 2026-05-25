@@ -62,7 +62,7 @@ export async function fetchAll<T>(path: string): Promise<T[]> {
     if (!res.ok) throw new Error(`${res.status}`)
     const data = (await res.json()) as { results: T[]; next: string | null }
     results.push(...data.results)
-    url = data.next ? data.next.replace('http://localhost:8080', '') : null
+    url = data.next ? new URL(data.next).pathname + new URL(data.next).search : null
   }
   return results
 }
