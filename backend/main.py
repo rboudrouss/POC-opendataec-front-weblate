@@ -1,42 +1,56 @@
 import binascii
 import os
 import re
-import secrets
 from contextlib import asynccontextmanager
 from typing import Optional
 
+import asyncpg
 import httpx
-import psycopg2
-import psycopg2.extras
-import psycopg2.pool
+import redis.asyncio as aioredis
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
-_pool: psycopg2.pool.SimpleConnectionPool | None = None
+_pool: asyncpg.Pool | None = None
+_redis: aioredis.Redis | None = None
+
+limiter = Limiter(key_func=get_remote_address)
+
+TOKEN_TTL = 3600  # 1h cache
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _pool
-    _pool = psycopg2.pool.SimpleConnectionPool(
-        1,
-        10,
+    global _pool, _redis
+    _pool = await asyncpg.create_pool(
         host=os.environ["POSTGRES_HOST"],
         port=int(os.environ.get("POSTGRES_PORT", 5432)),
-        dbname=os.environ["POSTGRES_DB"],
+        database=os.environ["POSTGRES_DB"],
         user=os.environ["POSTGRES_USER"],
         password=os.environ["POSTGRES_PASSWORD"],
+        min_size=2,
+        max_size=20,
+    )
+    _redis = aioredis.from_url(
+        f"redis://{os.environ.get('REDIS_HOST', 'redis')}",
+        decode_responses=True,
     )
     yield
-    _pool.closeall()
+    await _pool.close()
+    await _redis.aclose()
 
 
 app = FastAPI(lifespan=lifespan)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS != [""] else ["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -45,40 +59,31 @@ WEBLATE_URL = os.environ.get("WEBLATE_URL", "http://weblate:8080")
 WEBLATE_HOST = os.environ.get("WEBLATE_SITE_DOMAIN", "localhost")
 
 
-class _Conn:
-    def __enter__(self):
-        self.conn = _pool.getconn()
-        self.cur = self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        return self.conn, self.cur
-
-    def __exit__(self, exc, *_):
-        if exc:
-            self.conn.rollback()
-        else:
-            self.conn.commit()
-        self.cur.close()
-        _pool.putconn(self.conn)
-
-
 def _token_from_header(authorization: str | None) -> str:
     if not authorization or not authorization.startswith("Token "):
         raise HTTPException(401, "Missing token")
     return authorization.removeprefix("Token ")
 
 
-def _username_for_token(token: str) -> str:
-    with _Conn() as (_, cur):
-        cur.execute(
+async def _username_for_token(token: str) -> str:
+    cache_key = f"token:{token}"
+    cached = await _redis.get(cache_key)
+    if cached:
+        return cached
+
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow(
             """
             SELECT u.username FROM weblate_auth_user u
             JOIN authtoken_token t ON t.user_id = u.id
-            WHERE t.key = %s
+            WHERE t.key = $1
             """,
-            (token,),
+            token,
         )
-        row = cur.fetchone()
     if not row:
         raise HTTPException(401, "Invalid token")
+
+    await _redis.setex(cache_key, TOKEN_TTL, row["username"])
     return row["username"]
 
 
@@ -93,7 +98,8 @@ class LoginRequest(BaseModel):
 
 
 @app.post("/auth/login")
-async def login(body: LoginRequest):
+@limiter.limit("10/minute")
+async def login(request: Request, body: LoginRequest):
     try:
         async with httpx.AsyncClient(follow_redirects=False) as client:
             r1 = await client.get(
@@ -121,26 +127,28 @@ async def login(body: LoginRequest):
     if r2.status_code != 302:
         raise HTTPException(401, "Identifiants incorrects")
 
-    with _Conn() as (conn, cur):
-        cur.execute(
-            "SELECT id FROM weblate_auth_user WHERE username = %s", (body.username,)
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id FROM weblate_auth_user WHERE username = $1", body.username
         )
-        row = cur.fetchone()
         if not row:
             raise HTTPException(401, "User not found")
         user_id = row["id"]
 
-        cur.execute("SELECT key FROM authtoken_token WHERE user_id = %s", (user_id,))
-        row = cur.fetchone()
-        if row:
-            token = row["key"]
+        token_row = await conn.fetchrow(
+            "SELECT key FROM authtoken_token WHERE user_id = $1", user_id
+        )
+        if token_row:
+            token = token_row["key"]
         else:
             token = binascii.hexlify(os.urandom(20)).decode()
-            cur.execute(
-                "INSERT INTO authtoken_token (key, user_id, created) VALUES (%s, %s, NOW())",
-                (token, user_id),
+            await conn.execute(
+                "INSERT INTO authtoken_token (key, user_id, created) VALUES ($1, $2, NOW())",
+                token,
+                user_id,
             )
 
+    await _redis.setex(f"token:{token}", TOKEN_TTL, body.username)
     return {"token": token, "username": body.username}
 
 
@@ -161,71 +169,64 @@ class VoteRequest(BaseModel):
     value: int  # 1 or -1
 
 
-def _suggestion_row(cur, suggestion_id: int, username: str | None) -> dict:
-    cur.execute(
+async def _suggestion_row(conn: asyncpg.Connection, suggestion_id: int, username: str | None) -> dict:
+    row = await conn.fetchrow(
         """
         SELECT s.id, s.target, u.username AS "user", s.timestamp,
                COALESCE(SUM(v.value), 0) AS num_votes
         FROM trans_suggestion s
         LEFT JOIN weblate_auth_user u ON u.id = s.user_id
         LEFT JOIN trans_vote v ON v.suggestion_id = s.id
-        WHERE s.id = %s
+        WHERE s.id = $1
         GROUP BY s.id, s.target, u.username, s.timestamp
         """,
-        (suggestion_id,),
+        suggestion_id,
     )
-    row = dict(cur.fetchone())
-    row["timestamp"] = str(row["timestamp"])
-    row["num_votes"] = int(row["num_votes"])
+    d = dict(row)
+    d["timestamp"] = str(d["timestamp"])
+    d["num_votes"] = int(d["num_votes"])
     if username:
-        cur.execute(
+        uv = await conn.fetchrow(
             "SELECT value FROM trans_vote v "
             "JOIN weblate_auth_user u ON u.id = v.user_id "
-            "WHERE v.suggestion_id = %s AND u.username = %s",
-            (suggestion_id, username),
+            "WHERE v.suggestion_id = $1 AND u.username = $2",
+            suggestion_id,
+            username,
         )
-        uv = cur.fetchone()
-        row["user_vote"] = uv["value"] if uv else None
+        d["user_vote"] = uv["value"] if uv else None
     else:
-        row["user_vote"] = None
-    return row
+        d["user_vote"] = None
+    return d
 
 
 @app.get("/suggestions/{unit_id}")
-async def list_suggestions(
-    unit_id: int, authorization: Optional[str] = Header(None)
-):
+async def list_suggestions(unit_id: int, authorization: Optional[str] = Header(None)):
     token = _token_from_header(authorization)
-    username = _username_for_token(token)
+    username = await _username_for_token(token)
 
-    with _Conn() as (_, cur):
-        cur.execute(
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
             """
             SELECT s.id, s.target, u.username AS "user", s.timestamp,
-                   COALESCE(SUM(v.value), 0) AS num_votes
+                   COALESCE(SUM(v.value), 0) AS num_votes,
+                   uv.value AS user_vote
             FROM trans_suggestion s
             LEFT JOIN weblate_auth_user u ON u.id = s.user_id
             LEFT JOIN trans_vote v ON v.suggestion_id = s.id
-            WHERE s.unit_id = %s
-            GROUP BY s.id, s.target, u.username, s.timestamp
+            LEFT JOIN weblate_auth_user me ON me.username = $2
+            LEFT JOIN trans_vote uv ON uv.suggestion_id = s.id AND uv.user_id = me.id
+            WHERE s.unit_id = $1
+            GROUP BY s.id, s.target, u.username, s.timestamp, uv.value
             ORDER BY num_votes DESC
             """,
-            (unit_id,),
+            unit_id,
+            username,
         )
-        rows = cur.fetchall()
         result = []
         for row in rows:
             d = dict(row)
             d["timestamp"] = str(d["timestamp"])
             d["num_votes"] = int(d["num_votes"])
-            cur.execute(
-                "SELECT value FROM trans_vote v "
-                "JOIN weblate_auth_user u ON u.id = v.user_id "
-                "WHERE v.suggestion_id = %s AND u.username = %s",
-                (d["id"], username),
-            )
-            uv = cur.fetchone()
-            d["user_vote"] = uv["value"] if uv else None
             result.append(d)
 
     return result
@@ -238,29 +239,30 @@ async def create_suggestion(
     authorization: Optional[str] = Header(None),
 ):
     token = _token_from_header(authorization)
-    username = _username_for_token(token)
+    username = await _username_for_token(token)
 
-    with _Conn() as (_, cur):
-        cur.execute(
-            "SELECT id FROM weblate_auth_user WHERE username = %s", (username,)
+    async with _pool.acquire() as conn:
+        user_row = await conn.fetchrow(
+            "SELECT id FROM weblate_auth_user WHERE username = $1", username
         )
-        user_id = cur.fetchone()["id"]
+        user_id = user_row["id"]
 
-        cur.execute(
-            "SELECT id FROM trans_suggestion WHERE unit_id = %s AND target = %s",
-            (unit_id, body.target),
+        existing = await conn.fetchrow(
+            "SELECT id FROM trans_suggestion WHERE unit_id = $1 AND target = $2",
+            unit_id,
+            body.target,
         )
-        existing = cur.fetchone()
         if existing:
-            return _suggestion_row(cur, existing["id"], username)
+            return await _suggestion_row(conn, existing["id"], username)
 
-        cur.execute(
+        new_id = await conn.fetchval(
             "INSERT INTO trans_suggestion (target, unit_id, user_id, timestamp) "
-            "VALUES (%s, %s, %s, NOW()) RETURNING id",
-            (body.target, unit_id, user_id),
+            "VALUES ($1, $2, $3, NOW()) RETURNING id",
+            body.target,
+            unit_id,
+            user_id,
         )
-        new_id = cur.fetchone()["id"]
-        return _suggestion_row(cur, new_id, username)
+        return await _suggestion_row(conn, new_id, username)
 
 
 @app.post("/suggestions/{suggestion_id}/vote")
@@ -270,48 +272,48 @@ async def vote_suggestion(
     authorization: Optional[str] = Header(None),
 ):
     token = _token_from_header(authorization)
-    username = _username_for_token(token)
+    username = await _username_for_token(token)
     value = 1 if body.value == 1 else -1
 
-    with _Conn() as (_, cur):
-        cur.execute(
-            "SELECT id FROM weblate_auth_user WHERE username = %s", (username,)
+    async with _pool.acquire() as conn:
+        user_row = await conn.fetchrow(
+            "SELECT id FROM weblate_auth_user WHERE username = $1", username
         )
-        user_id = cur.fetchone()["id"]
+        user_id = user_row["id"]
 
-        cur.execute(
-            "SELECT id, value FROM trans_vote WHERE suggestion_id = %s AND user_id = %s",
-            (suggestion_id, user_id),
+        existing_vote = await conn.fetchrow(
+            "SELECT id, value FROM trans_vote WHERE suggestion_id = $1 AND user_id = $2",
+            suggestion_id,
+            user_id,
         )
-        existing_vote = cur.fetchone()
 
         if existing_vote and existing_vote["value"] == value:
-            cur.execute("DELETE FROM trans_vote WHERE id = %s", (existing_vote["id"],))
+            await conn.execute("DELETE FROM trans_vote WHERE id = $1", existing_vote["id"])
         elif existing_vote:
-            cur.execute(
-                "UPDATE trans_vote SET value = %s WHERE id = %s",
-                (value, existing_vote["id"]),
+            await conn.execute(
+                "UPDATE trans_vote SET value = $1 WHERE id = $2",
+                value,
+                existing_vote["id"],
             )
         else:
-            cur.execute(
-                "INSERT INTO trans_vote (suggestion_id, user_id, value) VALUES (%s, %s, %s)",
-                (suggestion_id, user_id, value),
+            await conn.execute(
+                "INSERT INTO trans_vote (suggestion_id, user_id, value) VALUES ($1, $2, $3)",
+                suggestion_id,
+                user_id,
+                value,
             )
 
-        cur.execute(
-            "SELECT COALESCE(SUM(value), 0) AS num_votes FROM trans_vote WHERE suggestion_id = %s",
-            (suggestion_id,),
+        num_votes = await conn.fetchval(
+            "SELECT COALESCE(SUM(value), 0) FROM trans_vote WHERE suggestion_id = $1",
+            suggestion_id,
         )
-        num_votes = int(cur.fetchone()["num_votes"])
-
-        cur.execute(
-            "SELECT value FROM trans_vote WHERE suggestion_id = %s AND user_id = %s",
-            (suggestion_id, user_id),
+        uv = await conn.fetchrow(
+            "SELECT value FROM trans_vote WHERE suggestion_id = $1 AND user_id = $2",
+            suggestion_id,
+            user_id,
         )
-        uv = cur.fetchone()
-        user_vote = uv["value"] if uv else None
 
-    return {"id": suggestion_id, "num_votes": num_votes, "user_vote": user_vote}
+    return {"id": suggestion_id, "num_votes": int(num_votes), "user_vote": uv["value"] if uv else None}
 
 
 @app.patch("/suggestions/{suggestion_id}")
@@ -321,23 +323,23 @@ async def edit_suggestion(
     authorization: Optional[str] = Header(None),
 ):
     token = _token_from_header(authorization)
-    username = _username_for_token(token)
+    username = await _username_for_token(token)
 
-    with _Conn() as (_, cur):
-        cur.execute(
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow(
             "SELECT s.id, u.username AS owner FROM trans_suggestion s "
             "LEFT JOIN weblate_auth_user u ON u.id = s.user_id "
-            "WHERE s.id = %s",
-            (suggestion_id,),
+            "WHERE s.id = $1",
+            suggestion_id,
         )
-        row = cur.fetchone()
         if not row:
             raise HTTPException(404, "Suggestion not found")
         if row["owner"] and row["owner"] != username:
             raise HTTPException(403, "Not authorized")
 
-        cur.execute(
-            "UPDATE trans_suggestion SET target = %s WHERE id = %s",
-            (body.target, suggestion_id),
+        await conn.execute(
+            "UPDATE trans_suggestion SET target = $1 WHERE id = $2",
+            body.target,
+            suggestion_id,
         )
-        return _suggestion_row(cur, suggestion_id, username)
+        return await _suggestion_row(conn, suggestion_id, username)

@@ -56,10 +56,14 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-weblate}
       WEBLATE_URL: http://weblate:8080
       WEBLATE_SITE_DOMAIN: ${WEBLATE_SITE_DOMAIN:-localhost}
+      REDIS_HOST: redis
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
     depends_on:
       db:
         condition: service_healthy
       weblate:
+        condition: service_started
+      redis:
         condition: service_started
     restart: unless-stopped
 
